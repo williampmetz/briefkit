@@ -215,3 +215,48 @@ Sketch of what it will need, so the shape isn't rediscovered from scratch:
   block the queue forever or retry silently until the end of time.
 
 The reads side of hydration can use `FeedClient` today, unchanged.
+
+## Where the write path is being built, and when it moves here
+
+**In `hydration/ios/`, not here — for now.** The same rule that governed
+FeedClient's extraction governs this one: you cannot design a good shared API
+from one caller. FeedClient came here when hydration became the second
+consumer of a cache layer that already worked. An outbox has exactly one
+caller today, and building it here first would bake hydration's particular
+shape — ounces, beverage types, an effective-dated goal — into an API that
+Daily Reflections then has to fight.
+
+**The extraction trigger, so it isn't re-litigated:** when a second app needs
+to write while offline. Daily Reflections is the obvious candidate — it posts
+entries the same way. At that point the outbox moves here, this section is
+replaced by real documentation, and the sketch above stops being speculation
+because there are two callers to generalise from.
+
+Until then the sketch stands as the specification, and hydration's
+implementation is the reference. Anything it learns that the sketch got wrong
+belongs up there, in this file, even while the code lives elsewhere — the
+point of writing it down early was to not rediscover it.
+
+### What building it taught, that the sketch above missed
+
+Implemented in `hydration/ios/Hydration/Hydration/Outbox.swift`, with tests
+in `hydration/ios/Harness/`. Three things the five bullets didn't say:
+
+- **"Retryable" is two categories, and they must be treated oppositely.**
+  Offline, a gateway 502/503/504, a 408 or a 429 say nothing about the
+  item — retry forever, never count it. A 500 means the app ran THIS request
+  and blew up — retry with backoff, but count it and park it eventually. A
+  single "give up after N attempts" rule would park every queued drink after a
+  week off the tailnet, which is the ordinary case this whole package exists
+  for. That split is what the poison-message bullet actually requires.
+- **A queued operation needs its own id, separate from the entry's.** A create
+  and the delete that undoes it are two operations on one entry. Keying the
+  queue on the entry's client id meant a successful create removed its own
+  pending delete, so a drink logged and deleted offline came back on
+  reconnect. The tests caught it; reading the code had not.
+- **Offline makes the day boundary real.** Online, a cached feed is always
+  today's. Offline overnight it is yesterday's, and showing it as-is greets
+  you with last night's totals. Anything that buckets by day has to compare
+  against the current date in the SERVER's timezone, and a feed from an
+  earlier day contributes nothing but its schedule — which is why hydration's
+  feed carries tomorrow's.
