@@ -190,73 +190,83 @@ other clue, and it is the single most common way push setup fails.
 
 ---
 
-# Not here yet: the write path
+# The write path
 
-Everything above assumes **read-only**: fetch, cache, display. Morning Edition
-never sends anything back.
+`Outbox`, `WriteTransport` and `WriteError`: queue a write durably, show it
+at once, send it when the server is reachable, and never lose it or send it
+twice. Built in `hydration/ios/` against one real caller, and moved here when
+Daily Reflections became the second app to write offline — the trigger this
+section used to name.
 
-Hydration does. Logging a drink while offline has to be kept locally and
-submitted when connectivity returns, which is a genuinely harder problem than
-cache-first reads and deliberately **not** designed here — building it
-speculatively, against no real caller, is how you get the wrong abstraction.
+## What an app supplies
 
-Sketch of what it will need, so the shape isn't rediscovered from scratch:
+1. **An operation type** conforming to `OutboxOperation` — usually an enum
+   with a create case and one or two delete cases. It reports `isCreate` and
+   `targetClientId`, and is stored inside the queue file, so its `Codable`
+   shape is a file format: add fields as optionals, rename nothing.
+   `hydration/ios/Hydration/Hydration/HydrationOperation.swift` is the
+   reference.
+2. **A small client** over `WriteTransport` that knows its endpoints and
+   bodies. `WriteTransport` does the HTTP: JSON in and out, every failure
+   mapped to a `WriteError`, FastAPI's `detail` pulled out for display, and
+   `WriteTransport.timestamp(_:)` for the RFC 3339 UTC form the servers
+   require.
+3. **A `send` closure** passed to `Outbox.drain`, switching on the operation
+   and calling the client.
+4. **Typealiases with names of their own** — `typealias HydrationOutbox =
+   Outbox<HydrationOperation>`, `typealias QueuedWrite =
+   OutboxItem<HydrationOperation>` — never an app type called `Outbox` or
+   `OutboxItem`, which is the shadowing trap under "Using it".
 
-- A **durable outbox**: pending mutations written to disk before the UI
-  acknowledges them, drained on connectivity.
-- **Client-generated idempotency keys.** A retry whose first attempt actually
-  succeeded must not log the drink twice. This is a server change too — the
-  endpoint has to recognise a repeated key.
-- **Optimistic UI with a pending state.** The count goes up immediately; the
-  entry is visibly unsynced until it isn't.
-- **Ordering and clock skew.** The client's timestamp is the real one; the
-  server should not stamp arrival time.
-- **A poison-message escape.** A mutation the server keeps rejecting must not
-  block the queue forever or retry silently until the end of time.
+The server's half is the same in every app: a nullable `client_id UUID
+UNIQUE` column (a replay returns the stored row with 200), a client-supplied
+timestamp that must carry an offset and has no lower bound, and delete by
+`client_id`. See `hydration/migrations/002_offline_writes.sql` and
+`daily-reflections/migrations/003_offline_writes.sql`.
 
-The reads side of hydration can use `FeedClient` today, unchanged.
+## The rules, and why
 
-## Where the write path is being built, and when it moves here
+- **Durable before visible.** `enqueue` writes to Application Support before
+  it returns. Show a pending row only after that.
+- **Two ids.** An item's `id` is the queued OPERATION; the entry's client id
+  lives in the operation. A create and the delete that undoes it share a
+  target and must not share an id — keying the queue on the entry meant a
+  successful create removed its own pending delete, so a drink logged and
+  deleted offline came back on reconnect. The tests caught it; reading the
+  code had not.
+- **Three dispositions, not two** (`WriteError.disposition`). Offline, a
+  gateway 502/503/504, a 408 or a 429 say nothing about the item: retry
+  forever, never count it. A 500 or an unreadable reply means the app ran
+  THIS request and choked: retry with backoff, count it, park it after
+  `OutboxPolicy.parkAfterItemFailures`. Any other 4xx parks immediately. A
+  single "give up after N" rule would park every queued write after a week
+  off the tailnet, which is the ordinary case this package exists for.
+- **Drain stops on transient, steps over parked.** Stopping preserves order —
+  a delete must never overtake its create. Stepping over keeps one bad item
+  from wedging the queue, and is safe because every operation is idempotent
+  against a create that never happened.
+- **Backoff is for the unattended loop only.** Anything a person or the
+  network triggers drains immediately (`respectBackoff: false`).
+- **An unreadable queue file is renamed, never deleted.** It holds the only
+  copy of writes the server hasn't seen.
+- **Offline makes the day boundary real.** A cached feed from an earlier day
+  must contribute no rows to "today", and "today" is the SERVER's timezone.
+  This lives in each app's store, not here, but every app that buckets by day
+  meets it.
 
-**In `hydration/ios/`, not here — for now.** The same rule that governed
-FeedClient's extraction governs this one: you cannot design a good shared API
-from one caller. FeedClient came here when hydration became the second
-consumer of a cache layer that already worked. An outbox has exactly one
-caller today, and building it here first would bake hydration's particular
-shape — ounces, beverage types, an effective-dated goal — into an API that
-Daily Reflections then has to fight.
+## Reference implementation and tests
 
-**The extraction trigger, so it isn't re-litigated:** when a second app needs
-to write while offline. Daily Reflections is the obvious candidate — it posts
-entries the same way. At that point the outbox moves here, this section is
-replaced by real documentation, and the sketch above stops being speculation
-because there are two callers to generalise from.
+`hydration/ios/Hydration/Hydration/HydrationStore.swift` is the worked
+example of a store driving an outbox: the optimistic merge, holding sent
+writes until a refresh that began after them has applied, and ticketing
+refreshes so an older response can't roll the screen back.
 
-Until then the sketch stands as the specification, and hydration's
-implementation is the reference. Anything it learns that the sketch got wrong
-belongs up there, in this file, even while the code lives elsewhere — the
-point of writing it down early was to not rediscover it.
+The tests are in `hydration/ios/Harness/` (`OutboxTests`, run by
+`run-linux.sh`). They import BriefKit as a module, so they exercise the
+package through its public API. Scenario 18 loads
+`Harness/Fixtures/queue-pre-briefkit.json`, a queue written by the
+non-generic hydration build, to prove the move changed nothing on disk.
 
-### What building it taught, that the sketch above missed
-
-Implemented in `hydration/ios/Hydration/Hydration/Outbox.swift`, with tests
-in `hydration/ios/Harness/`. Three things the five bullets didn't say:
-
-- **"Retryable" is two categories, and they must be treated oppositely.**
-  Offline, a gateway 502/503/504, a 408 or a 429 say nothing about the
-  item — retry forever, never count it. A 500 means the app ran THIS request
-  and blew up — retry with backoff, but count it and park it eventually. A
-  single "give up after N attempts" rule would park every queued drink after a
-  week off the tailnet, which is the ordinary case this whole package exists
-  for. That split is what the poison-message bullet actually requires.
-- **A queued operation needs its own id, separate from the entry's.** A create
-  and the delete that undoes it are two operations on one entry. Keying the
-  queue on the entry's client id meant a successful create removed its own
-  pending delete, so a drink logged and deleted offline came back on
-  reconnect. The tests caught it; reading the code had not.
-- **Offline makes the day boundary real.** Online, a cached feed is always
-  today's. Offline overnight it is yesterday's, and showing it as-is greets
-  you with last night's totals. Anything that buckets by day has to compare
-  against the current date in the SERVER's timezone, and a feed from an
-  earlier day contributes nothing but its schedule — which is why hydration's
-  feed carries tomorrow's.
+`OutboxPolicy` holds the constants because a generic type can't have static
+stored properties. Its doc comment has the backoff table, worked out rather
+than estimated.
